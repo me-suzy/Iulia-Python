@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 from bs4 import BeautifulSoup
 from pathlib import Path
 import datetime
@@ -290,7 +291,7 @@ def analyze_category_file(content):
     }
 
 def update_category_file(category_file_path, article_entries_by_year):
-    """Update the category file with new article entries sorted by year."""
+    """Update the category file with new article entries sorted by date."""
     content = read_file_with_fallback_encoding(category_file_path)
     if not content:
         return False
@@ -301,23 +302,29 @@ def update_category_file(category_file_path, article_entries_by_year):
     # Extract existing URLs to avoid duplicates
     existing_urls = extract_existing_urls(content)
 
-    # Check which URLs already exist and filter the entries
-    filtered_article_entries = {}
+    # Get all existing articles with their dates
+    existing_articles = extract_existing_articles(content)
+
+    # Filter and prepare new articles
+    new_articles = []
     for year, entries in article_entries_by_year.items():
-        filtered_entries = []
         for entry_info in entries:
             if entry_info['url'] not in existing_urls:
-                filtered_entries.append(entry_info)
-            else:
-                print(f"  [Info] Skipping existing URL: {entry_info['url']}")
+                article_date = entry_info['info']['datetime']
+                new_articles.append({
+                    'date': article_date,
+                    'entry': create_new_article_entry(entry_info['info'])
+                })
 
-        if filtered_entries:
-            filtered_article_entries[year] = filtered_entries
-
-    # If no entries left after filtering, skip this category
-    if not filtered_article_entries:
+    if not new_articles:
         print(f"  [Info] No new articles to add after filtering duplicates")
         return True
+
+    # Combine existing and new articles
+    all_articles = existing_articles + new_articles
+
+    # Sort all articles by date (newest first)
+    all_articles.sort(key=lambda x: x['date'], reverse=True)
 
     # Analyze file structure
     analysis = analyze_category_file(content)
@@ -327,8 +334,6 @@ def update_category_file(category_file_path, article_entries_by_year):
 
     # Find the start marker
     start_marker = "<!-- ARTICOL CATEGORIE START -->"
-
-    # Split at the start marker
     parts = content.split(start_marker, 1)
     if len(parts) != 2:
         print(f"  [Error] Invalid content format in category file")
@@ -342,82 +347,77 @@ def update_category_file(category_file_path, article_entries_by_year):
 
     # Handle opening div tag
     if analysis['has_opening_div']:
-        # Extract the opening div tag with exact formatting
         div_match = re.match(r'(\s*<div align="justify">\s*)', after_marker)
         if div_match:
             opening_div = div_match.group(1)
             new_content += opening_div
-            # Remove the opening div from the remaining content
             after_marker = after_marker[len(opening_div):]
         else:
-            # Should not happen if analysis is correct
             new_content += "\n<div align=\"justify\">\n"
     else:
         new_content += "\n<div align=\"justify\">\n"
 
-    # Add recent articles (2022 and newer) at the top - sorted by date (newest first)
-    recent_years = sorted([y for y in filtered_article_entries.keys() if y >= 2022], reverse=True)
-    for year in recent_years:
-        # Sort entries by sort_key (year-month-day) in descending order
-        sorted_entries = sorted(filtered_article_entries[year], key=lambda e: e['info']['sort_key'], reverse=True)
-        for entry_info in sorted_entries:
-            # Create article entry with the stored info
-            article_info = entry_info['info']
-            entry = create_new_article_entry(article_info, analysis['table_width'])
-            new_content += entry + "\n"
-
-    # Process older articles - sorted by date (newest first)
-    older_articles = []
-    older_years = sorted([y for y in filtered_article_entries.keys() if y < 2022], reverse=True)
-    for year in older_years:
-        # Sort entries by sort_key (year-month-day) in descending order
-        sorted_entries = sorted(filtered_article_entries[year], key=lambda e: e['info']['sort_key'], reverse=True)
-        for entry_info in sorted_entries:
-            # Create article entry with the stored info
-            article_info = entry_info['info']
-            entry = create_new_article_entry(article_info, analysis['table_width'])
-            older_articles.append(entry)
+    # Add all articles in correct order
+    for article in all_articles:
+        new_content += article['entry'] + "\n"
 
     # Add the rest of the content
     if analysis['has_end_marker']:
         end_idx = after_marker.find("<!-- ARTICOL CATEGORIE FINAL -->")
-        if analysis['has_closing_structure']:
-            # Find the closing div before the end marker
-            closing_idx = after_marker.rfind("</div>", 0, end_idx)
-            if closing_idx != -1:
-                # Add content up to closing div
-                new_content += after_marker[:closing_idx]
-
-                # Add older articles before closing div
-                if older_articles:
-                    new_content += "\n" + "\n".join(older_articles) + "\n"
-
-                # Add closing structure with correct indentation
-                new_content += "          </div>\n          <p align=\"justify\" class=\"text_obisnuit style3\"> </p>\n<!-- ARTICOL CATEGORIE FINAL -->"
-
-                # Add content after end marker
-                after_end = after_marker.split("<!-- ARTICOL CATEGORIE FINAL -->", 1)[1]
-                new_content += after_end
-            else:
-                # Can't find closing div, add older articles at the end
-                new_content += after_marker[:end_idx]
-                if older_articles:
-                    new_content += "\n" + "\n".join(older_articles) + "\n"
-                new_content += "<!-- ARTICOL CATEGORIE FINAL -->" + after_marker[end_idx + len("<!-- ARTICOL CATEGORIE FINAL -->"):]
+        if end_idx != -1:
+            new_content += after_marker[end_idx:]
         else:
-            # No closing structure, just end marker
-            new_content += after_marker[:end_idx]
-            if older_articles:
-                new_content += "\n" + "\n".join(older_articles) + "\n"
-            new_content += "<!-- ARTICOL CATEGORIE FINAL -->" + after_marker[end_idx + len("<!-- ARTICOL CATEGORIE FINAL -->"):]
+            new_content += after_marker
     else:
-        # No end marker, just append everything
         new_content += after_marker
-        if older_articles:
-            new_content += "\n" + "\n".join(older_articles)
 
     # Write the updated content back to the file
     return write_file_with_encoding(category_file_path, new_content)
+
+def extract_existing_articles(content):
+    """Extract all existing articles with their dates from category content."""
+    articles = []
+
+    # Split content into individual articles
+    article_blocks = re.split(r'(<table width="\d+" border="0">.*?</table>\s*<p class="text_obisnuit2">.*?</p>\s*<table width="552" border="0">.*?</table>\s*<p class="text_obisnuit">\s*</p>)',
+                             content, flags=re.DOTALL)
+
+    # Filter out empty strings and non-article blocks
+    article_blocks = [block for block in article_blocks if block.strip() and '<table width=' in block]
+
+    for block in article_blocks:
+        # Extract date
+        date_match = re.search(r'On (.*?), in <a href="[^"]+" title="[^"]+" class="[^"]+" rel="[^"]+">[^<]+</a>, by Neculai Fantanaru', block)
+        if not date_match:
+            continue
+
+        date_str = date_match.group(1)
+        try:
+            # Parse date
+            if ',' in date_str:
+                # English date format "February 28, 2022"
+                date_obj = datetime.strptime(date_str, '%B %d, %Y')
+            else:
+                # Romanian date format "Decembrie 31, 2024"
+                months_ro = {
+                    'ianuarie': 1, 'februarie': 2, 'martie': 3, 'aprilie': 4,
+                    'mai': 5, 'iunie': 6, 'iulie': 7, 'august': 8,
+                    'septembrie': 9, 'octombrie': 10, 'noiembrie': 11, 'decembrie': 12
+                }
+                month_day, year = date_str.split(', ')
+                month_ro, day = month_day.split(' ')
+                month = months_ro.get(month_ro.lower(), 1)
+                date_obj = datetime(int(year), month, int(day))
+
+            articles.append({
+                'date': date_obj,
+                'entry': block
+            })
+        except Exception as e:
+            print(f"  [Error] Could not parse date '{date_str}': {str(e)}")
+            continue
+
+    return articles
 
 def update_index_file(index_file_path, all_articles):
     """Update the index.html file with recent articles (last 4 months)."""
@@ -486,11 +486,86 @@ def update_index_file(index_file_path, all_articles):
     # Write updated content
     return write_file_with_encoding(index_file_path, new_content)
 
+def backup_all_files(target_dir, processed_category_files, output_dir, backup_dir):
+    """Backup both processed target HTML files and original output HTML files to a backup directory."""
+    print("\nStep 5: Backing up all processed files...")
+    print("=" * 60)
+
+    # Create backup directory if it doesn't exist
+    if not os.path.exists(backup_dir):
+        try:
+            os.makedirs(backup_dir)
+            print(f"  [Info] Created backup directory: {backup_dir}")
+        except Exception as e:
+            print(f"  [Error] Failed to create backup directory: {str(e)}")
+            return False
+
+    # Part 1: Copy the modified files from target directory
+    backed_up_target = 0
+    target_errors = 0
+
+    # Copy index.html first
+    index_file = os.path.join(target_dir, "index.html")
+    if os.path.exists(index_file):
+        try:
+            shutil.copy2(index_file, os.path.join(backup_dir, "index.html"))
+            backed_up_target += 1
+            print(f"  [Success] Backed up target file: index.html")
+        except Exception as e:
+            target_errors += 1
+            print(f"  [Error] Failed to backup index.html: {str(e)}")
+
+    # Copy all category files that were processed
+    for category_file in processed_category_files:
+        source_path = os.path.join(target_dir, category_file)
+        dest_path = os.path.join(backup_dir, category_file)
+
+        try:
+            # Create subdirectories in backup if needed
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            shutil.copy2(source_path, dest_path)
+            backed_up_target += 1
+            print(f"  [Success] Backed up target file: {category_file}")
+        except Exception as e:
+            target_errors += 1
+            print(f"  [Error] Failed to backup target file {category_file}: {str(e)}")
+
+    # Part 2: Copy all original HTML files from output directory
+    backed_up_output = 0
+    output_errors = 0
+
+    if os.path.exists(output_dir):
+        for filename in os.listdir(output_dir):
+            if filename.endswith('.html'):
+                source_path = os.path.join(output_dir, filename)
+                dest_path = os.path.join(backup_dir, filename)
+
+                try:
+                    shutil.copy2(source_path, dest_path)
+                    backed_up_output += 1
+                    print(f"  [Success] Backed up output file: {filename}")
+                except Exception as e:
+                    output_errors += 1
+                    print(f"  [Error] Failed to backup output file {filename}: {str(e)}")
+    else:
+        print(f"  [Error] Output directory does not exist: {output_dir}")
+
+    print("\nBackup summary:")
+    print(f"- Target files backed up: {backed_up_target}")
+    print(f"- Target backup errors: {target_errors}")
+    print(f"- Output files backed up: {backed_up_output}")
+    print(f"- Output backup errors: {output_errors}")
+    print(f"- Total files backed up: {backed_up_target + backed_up_output}")
+    print("=" * 60)
+
+    return (backed_up_target + backed_up_output) > 0
+
 def process_articles():
     """Process all article files from output directory and update category files."""
     output_dir = r"e:\Carte\BB\17 - Site Leadership\alte\Ionel Balauta\Aryeht\Task 1 - Traduce tot site-ul\Doar Google Web\Andreea\Meditatii\2023\Iulia Python\output"
     target_dir = r"e:\Carte\BB\17 - Site Leadership\Principal\en"
     index_file = os.path.join(target_dir, "index.html")
+    backup_dir = r"c:\Folder1\fisiere_html"
 
     if not os.path.exists(output_dir):
         print(f"ERROR: Output directory does not exist: {output_dir}")
@@ -508,6 +583,12 @@ def process_articles():
 
     # Store all article info for later index.html update
     all_articles = []
+
+    # Keep track of processed category files for backup
+    processed_category_files = set()
+
+    # Keep track of processed article files for copying
+    processed_article_files = []
 
     # Process all articles first
     for filename in os.listdir(output_dir):
@@ -534,6 +615,12 @@ def process_articles():
         if not category_filename:
             print(f"  [Error] Could not extract category filename from link: {article_info['category_link']}")
             continue
+
+        # Add to the set of processed category files
+        processed_category_files.add(category_filename)
+
+        # Add to list of articles to be copied
+        processed_article_files.append((article_path, os.path.join(target_dir, filename)))
 
         # Organize articles by category
         if category_filename not in articles_by_category:
@@ -579,9 +666,29 @@ def process_articles():
 
         print("")  # Add an empty line for better readability
 
+    # Step 4: Copy processed articles from output to target directory
+    print("\nStep 4: Copying processed articles to target directory...")
+    print("=" * 60)
+    copied_articles = 0
+    copy_errors = 0
+
+    for src_path, dest_path in processed_article_files:
+        try:
+            shutil.copy2(src_path, dest_path)
+            copied_articles += 1
+            print(f"  [Success] Copied {os.path.basename(src_path)} to target directory")
+        except Exception as e:
+            copy_errors += 1
+            print(f"  [Error] Failed to copy {os.path.basename(src_path)}: {str(e)}")
+
+    print(f"\nCopied {copied_articles} articles to target directory")
+    print(f"Copy errors: {copy_errors}")
+    print("=" * 60)
+
     # Update index.html with recent articles
+    index_updated = False
     if os.path.exists(index_file):
-        update_index_file(index_file, all_articles)
+        index_updated = update_index_file(index_file, all_articles)
     else:
         print(f"ERROR: Index file does not exist: {index_file}")
 
@@ -590,7 +697,14 @@ def process_articles():
     print(f"- Total categories processed: {processed_categories}")
     print(f"- Successfully updated: {success_categories}")
     print(f"- Categories with errors: {error_categories}")
+    print(f"- Articles copied to target: {copied_articles}")
+    print(f"- Copy errors: {copy_errors}")
+    print(f"- Index.html updated: {'Yes' if index_updated else 'No'}")
     print("=" * 60)
+
+    # Step 5: Backup all processed files
+    backup_all_files(target_dir, processed_category_files, output_dir, backup_dir)
+
     print("Processing complete!")
 
 if __name__ == "__main__":
